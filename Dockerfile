@@ -1,5 +1,5 @@
-# Use Python 3.9+ as base image
-FROM python:3.9-slim
+# Use Python 3.13 for best performance
+FROM python:3.13-slim
 
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
