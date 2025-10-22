@@ -156,6 +156,58 @@ python overlay_sync_manager.py config.json
 
 ## Production Deployment
 
+### Docker (Recommended)
+
+The easiest way to run the overlay sync manager is with Docker:
+
+**Build and run with Docker Compose:**
+```bash
+# Build the image
+docker-compose build
+
+# Run in daemon mode (detached)
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+
+# Stop the service
+docker-compose down
+```
+
+**Build and run with Docker:**
+```bash
+# Build the image
+docker build -t hikvision-overlay .
+
+# Run in daemon mode
+docker run -d --name hikvision-overlay \
+  --network host \
+  -v $(pwd)/config.json:/app/config.json:ro \
+  hikvision-overlay
+
+# Run validation
+docker run --rm -v $(pwd)/config.json:/app/config.json:ro \
+  hikvision-overlay --validate config.json
+
+# Run once (test)
+docker run --rm -v $(pwd)/config.json:/app/config.json:ro \
+  hikvision-overlay --once config.json
+
+# View logs
+docker logs -f hikvision-overlay
+
+# Stop and remove
+docker stop hikvision-overlay
+docker rm hikvision-overlay
+```
+
+**Notes:**
+- Uses `--network host` to access cameras on local network
+- Config file is mounted read-only for security
+- Container restarts automatically unless stopped
+- Logs are managed by Docker (10MB max, 3 files)
+
 ### systemd Service (Linux)
 
 Create `/etc/systemd/system/overlay-sync.service`:

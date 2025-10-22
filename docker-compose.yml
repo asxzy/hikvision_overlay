@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  hikvision-overlay:
+    build:
+      context: https://github.com/asxzy/hikvision_overlay.git
+      dockerfile: Dockerfile
+    container_name: hikvision-overlay-sync
+    restart: unless-stopped
+    volumes:
+      # Mount config file to allow updates without rebuilding
+      - ./config.json:/app/config.json:ro
+    network_mode: host
+    # Use host network to access local cameras
+    # Alternative: use bridge network and expose ports if needed
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Optional: override command for validation or single run
+    # command: ["--validate", "config.json"]
+    # command: ["--once", "config.json"]

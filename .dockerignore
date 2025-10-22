@@ -1,0 +1,36 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+
+# Cache
+.ruff_cache
+
+# Documentation
+*.md
+!README.md
+
+# Development
+.specify
+specs
+.claude
+config.example.json
+config_multi.json
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
