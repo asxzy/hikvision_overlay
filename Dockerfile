@@ -15,7 +15,6 @@ RUN uv pip install --system -r requirements.txt
 
 # Copy application files
 COPY overlay_sync_manager.py .
-COPY config.json .
 
 # Set environment variables for Python
 ENV PYTHONUNBUFFERED=1
