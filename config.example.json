@@ -1,0 +1,103 @@
+{
+  "_comment_sync_interval": "How often to update overlays (in seconds). Minimum 1 second recommended.",
+  "sync_interval": 30,
+
+  "_comment_timeout": "HTTP request timeout (in seconds). Should be less than sync_interval.",
+  "timeout": 10,
+
+  "_comment_log_level": "Logging verbosity: DEBUG, INFO, WARNING, ERROR, CRITICAL",
+  "log_level": "INFO",
+
+  "_comment_cameras": "List of camera configurations. Each camera syncs independently.",
+  "cameras": [
+    {
+      "_comment": "Example 1: Front door camera with dynamic timestamp overlay",
+      "name": "front-door",
+      "ip": "192.168.1.100",
+      "port": 80,
+      "username": "admin",
+      "password": "your-camera-password",
+      "channel": 1,
+      "overlays": [
+        {
+          "id": "1",
+          "_comment_content": "Use {timestamp} for full date/time, {date} for date only, {time} for time only",
+          "content": "Front Door - {timestamp}",
+          "enabled": true,
+          "_comment_position": "Set to null to keep current position, or specify pixel coordinates",
+          "position_x": null,
+          "position_y": null
+        },
+        {
+          "id": "2",
+          "_comment_static": "Static text without placeholders",
+          "content": "Status: Monitoring",
+          "enabled": true,
+          "position_x": null,
+          "position_y": null
+        }
+      ]
+    },
+    {
+      "_comment": "Example 2: Backyard camera with date/time and camera name",
+      "name": "backyard",
+      "ip": "192.168.1.101",
+      "port": 80,
+      "username": "admin",
+      "password": "your-camera-password",
+      "channel": 1,
+      "overlays": [
+        {
+          "id": "1",
+          "_comment_placeholders": "Available: {timestamp}, {date}, {time}, {camera_name}, {overlay_id}",
+          "content": "{camera_name} | {date} {time}",
+          "enabled": true,
+          "position_x": null,
+          "position_y": null
+        }
+      ]
+    },
+    {
+      "_comment": "Example 3: Garage camera with custom port and multiple overlays",
+      "name": "garage",
+      "ip": "192.168.1.102",
+      "port": 8080,
+      "username": "admin",
+      "password": "your-camera-password",
+      "channel": 1,
+      "overlays": [
+        {
+          "id": "1",
+          "content": "Garage Entrance",
+          "enabled": true,
+          "position_x": 50,
+          "position_y": 50
+        },
+        {
+          "id": "2",
+          "content": "{time}",
+          "enabled": true,
+          "position_x": 50,
+          "position_y": 100
+        },
+        {
+          "id": "3",
+          "_comment_disabled": "Set enabled to false to skip this overlay",
+          "content": "Disabled overlay",
+          "enabled": false,
+          "position_x": null,
+          "position_y": null
+        }
+      ]
+    }
+  ],
+
+  "_notes": [
+    "Camera names must be unique across all cameras",
+    "Overlay IDs must be unique within each camera (typically '1' through '8')",
+    "Overlay text is limited to 44 characters (will be truncated if longer)",
+    "Position coordinates are in pixels from top-left corner",
+    "Template placeholders are case-sensitive",
+    "Changes require restarting the sync manager"
+  ]
+}

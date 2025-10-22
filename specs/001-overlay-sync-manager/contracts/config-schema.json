@@ -1,0 +1,155 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Overlay Sync Manager Configuration",
+  "description": "JSON configuration schema for the Hikvision Overlay Sync Manager",
+  "type": "object",
+  "required": ["sync_interval", "cameras"],
+  "properties": {
+    "sync_interval": {
+      "type": "integer",
+      "description": "Seconds between sync cycles",
+      "minimum": 1,
+      "maximum": 86400,
+      "examples": [30, 60, 300]
+    },
+    "timeout": {
+      "type": "integer",
+      "description": "HTTP request timeout in seconds",
+      "minimum": 1,
+      "maximum": 300,
+      "default": 10
+    },
+    "log_level": {
+      "type": "string",
+      "description": "Python logging level",
+      "enum": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+      "default": "INFO"
+    },
+    "cameras": {
+      "type": "array",
+      "description": "List of camera configurations",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/definitions/camera"
+      }
+    }
+  },
+  "definitions": {
+    "camera": {
+      "type": "object",
+      "required": ["name", "ip", "username", "password", "overlays"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Unique camera identifier (used in logs)",
+          "minLength": 1,
+          "examples": ["front-door", "backyard", "garage"]
+        },
+        "ip": {
+          "type": "string",
+          "description": "Camera IP address or hostname (optional :port suffix)",
+          "pattern": "^[a-zA-Z0-9.-]+(:[0-9]+)?$",
+          "examples": ["192.168.1.100", "camera.local", "192.168.1.100:8080"]
+        },
+        "port": {
+          "type": "integer",
+          "description": "Camera HTTP port",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 80
+        },
+        "username": {
+          "type": "string",
+          "description": "Camera admin username",
+          "minLength": 1
+        },
+        "password": {
+          "type": "string",
+          "description": "Camera admin password",
+          "minLength": 1
+        },
+        "channel": {
+          "type": "integer",
+          "description": "Video channel number",
+          "minimum": 1,
+          "default": 1
+        },
+        "overlays": {
+          "type": "array",
+          "description": "List of overlay definitions for this camera",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/definitions/overlay"
+          }
+        }
+      }
+    },
+    "overlay": {
+      "type": "object",
+      "required": ["id", "content"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Overlay ID (typically 1-8 on Hikvision cameras)",
+          "pattern": "^[1-9][0-9]?$",
+          "examples": ["1", "2", "3"]
+        },
+        "content": {
+          "type": "string",
+          "description": "Text content or template with {placeholders}",
+          "minLength": 1,
+          "maxLength": 100,
+          "examples": [
+            "Front Door - {timestamp}",
+            "Status: OK",
+            "{date} {time}",
+            "Camera: {camera_name}"
+          ]
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether to enable this overlay on the camera",
+          "default": true
+        },
+        "position_x": {
+          "type": ["integer", "null"],
+          "description": "X position in pixels (null to keep current)",
+          "minimum": 0,
+          "default": null
+        },
+        "position_y": {
+          "type": ["integer", "null"],
+          "description": "Y position in pixels (null to keep current)",
+          "minimum": 0,
+          "default": null
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "sync_interval": 30,
+      "timeout": 10,
+      "log_level": "INFO",
+      "cameras": [
+        {
+          "name": "front-door",
+          "ip": "192.168.1.100",
+          "port": 80,
+          "username": "admin",
+          "password": "password123",
+          "channel": 1,
+          "overlays": [
+            {
+              "id": "1",
+              "content": "Front Door - {timestamp}",
+              "enabled": true,
+              "position_x": null,
+              "position_y": null
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
