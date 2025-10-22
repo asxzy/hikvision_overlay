@@ -24,13 +24,12 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Any
+from typing import Any, List, Optional
 
 import httpx
 import requests
-from requests.auth import HTTPDigestAuth
 import urllib3
-
+from requests.auth import HTTPDigestAuth
 
 # Suppress SSL warnings for cameras with self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -96,6 +95,7 @@ class ConfigurationRoot:
         timeout: HTTP request timeout in seconds
         log_level: Python logging level (DEBUG, INFO, WARNING, ERROR)
         fast_mode: Skip GET requests and use minimal XML (faster but skips position updates)
+        stats_interval: Seconds between statistics reports (None to disable, 0 for auto)
     """
 
     sync_interval: int
@@ -103,6 +103,7 @@ class ConfigurationRoot:
     timeout: int = 10
     log_level: str = "INFO"
     fast_mode: bool = True  # Enable by default for better performance
+    stats_interval: Optional[int] = None  # None = disabled, 0 = auto, >0 = explicit interval
 
 
 @dataclass
@@ -180,6 +181,7 @@ def load_config(config_path: Path) -> ConfigurationRoot:
         timeout=data.get("timeout", 10),
         log_level=data.get("log_level", "INFO"),
         fast_mode=data.get("fast_mode", True),
+        stats_interval=data.get("stats_interval"),
     )
 
     return config
@@ -322,7 +324,12 @@ class HikvisionOverlayAsync:
     """
     Async client for interacting with Hikvision camera ISAPI text overlay endpoints.
     Uses httpx for non-blocking concurrent requests with digest auth support.
+
+    Optimized for persistent connections across multiple sync cycles.
     """
+
+    # Pre-compiled XML template for performance
+    _XML_TEMPLATE = '<?xml version="1.0" encoding="UTF-8"?>\n<TextOverlay version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">\n    <id>{}</id>\n    <enabled>{}</enabled>\n    <displayText>{}</displayText>\n</TextOverlay>'
 
     def __init__(self, ip: str, username: str, password: str, channel: int = 1):
         """
@@ -362,6 +369,22 @@ class HikvisionOverlayAsync:
         if self._client:
             await self._client.aclose()
 
+    async def initialize(self):
+        """Initialize the async client for persistent use. Call once at startup."""
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                auth=httpx.DigestAuth(self.username, self.password),
+                verify=False,
+                timeout=30.0,
+                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            )
+
+    async def close(self):
+        """Close the async client. Call at shutdown."""
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+
     async def update_overlay_text_fast(
         self,
         overlay_id: str,
@@ -381,20 +404,17 @@ class HikvisionOverlayAsync:
         Returns:
             True on success, False on error
         """
-        # Build minimal XML directly
-        xml_template = f"""<?xml version="1.0" encoding="UTF-8"?>
-<TextOverlay version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">
-    <id>{overlay_id}</id>
-    <enabled>{"true" if enable else "false"}</enabled>
-    <displayText>{new_text}</displayText>
-</TextOverlay>"""
+        # Use pre-compiled template for faster XML generation
+        xml_content = self._XML_TEMPLATE.format(
+            overlay_id, "true" if enable else "false", new_text
+        )
 
         url = f"http://{self.ip}/ISAPI/System/Video/inputs/channels/{self.channel}/overlays/text/{overlay_id}"
 
         try:
             response = await self._client.put(
                 url,
-                content=xml_template,
+                content=xml_content,
                 headers={"Content-Type": "application/xml"},
                 timeout=timeout,
             )
@@ -816,34 +836,26 @@ async def sync_overlay_async(
 async def sync_camera_async(
     camera: CameraConfig,
     timeout: int,
-) -> dict[str, int]:
+    client: Optional[HikvisionOverlayAsync] = None,
+) -> dict[str, Any]:
     """
     Async sync all overlays for a single camera.
 
     Args:
         camera: Camera configuration
         timeout: Request timeout in seconds
+        client: Optional persistent client (if None, creates temporary client)
 
     Returns:
-        Dictionary with 'success' and 'failed' counts
+        Dictionary with 'success', 'failed' counts, and 'duration' in seconds
     """
+    start_time = time.time()
     success_count = 0
     failed_count = 0
 
-    # Create async client with context manager
-    async with HikvisionOverlayAsync(
-        ip=camera.ip if ":" not in camera.ip else camera.ip.split(":")[0],
-        username=camera.username,
-        password=camera.password,
-        channel=camera.channel,
-    ) as client:
-        # Handle port
-        if camera.port != 80:
-            client.ip = f"{camera.ip}:{camera.port}"
-        elif ":" not in camera.ip:
-            client.ip = f"{camera.ip}:80"
-
-        # Sync all overlays concurrently using asyncio.gather
+    # Use provided persistent client or create temporary one
+    if client is not None:
+        # Use persistent client (no context manager needed)
         tasks = [
             sync_overlay_async(client, camera.name, overlay, timeout)
             for overlay in camera.overlays
@@ -858,22 +870,65 @@ async def sync_camera_async(
                 success_count += 1
             else:
                 failed_count += 1
+    else:
+        # Fallback: create temporary client with context manager
+        async with HikvisionOverlayAsync(
+            ip=camera.ip if ":" not in camera.ip else camera.ip.split(":")[0],
+            username=camera.username,
+            password=camera.password,
+            channel=camera.channel,
+        ) as temp_client:
+            # Handle port
+            if camera.port != 80:
+                temp_client.ip = f"{camera.ip}:{camera.port}"
+            elif ":" not in camera.ip:
+                temp_client.ip = f"{camera.ip}:80"
 
-    return {"success": success_count, "failed": failed_count}
+            # Sync all overlays concurrently using asyncio.gather
+            tasks = [
+                sync_overlay_async(temp_client, camera.name, overlay, timeout)
+                for overlay in camera.overlays
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Count successes and failures
+            for result in results:
+                if isinstance(result, Exception):
+                    failed_count += 1
+                elif result:
+                    success_count += 1
+                else:
+                    failed_count += 1
+
+    duration = time.time() - start_time
+    return {"success": success_count, "failed": failed_count, "duration": duration}
 
 
-async def sync_all_cameras_async(config: ConfigurationRoot) -> dict[str, Any]:
+async def sync_all_cameras_async(
+    config: ConfigurationRoot,
+    clients: Optional[dict[str, HikvisionOverlayAsync]] = None,
+) -> dict[str, Any]:
     """
     Async sync overlays for all cameras concurrently.
 
     Args:
         config: Configuration root object
+        clients: Optional dict of persistent clients by camera name
 
     Returns:
         Dictionary with sync results for all cameras
     """
     # Sync all cameras concurrently
-    tasks = [sync_camera_async(camera, config.timeout) for camera in config.cameras]
+    if clients:
+        # Use persistent clients
+        tasks = [
+            sync_camera_async(camera, config.timeout, clients.get(camera.name))
+            for camera in config.cameras
+        ]
+    else:
+        # Create temporary clients
+        tasks = [sync_camera_async(camera, config.timeout) for camera in config.cameras]
+
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     total_success = 0
@@ -1099,6 +1154,8 @@ def sync_all_cameras(config: ConfigurationRoot) -> dict[str, Any]:
 class SyncManager:
     """
     Manages periodic synchronization of camera overlays.
+
+    Optimized with persistent async clients and event loop for maximum performance.
     """
 
     def __init__(self, config: ConfigurationRoot):
@@ -1112,8 +1169,52 @@ class SyncManager:
         self.running = False
         self.syncing = False  # T026: Track if sync in progress
         self.cycle_count = 0
-        # Create persistent camera clients for connection reuse
+        # Create persistent camera clients for connection reuse (sync fallback)
         self.camera_clients = self._create_camera_clients()
+        # Create persistent async clients (for optimized async path)
+        self.async_clients: Optional[dict[str, HikvisionOverlayAsync]] = None
+        # Event loop for async operations
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # Runtime statistics tracking
+        self.start_time: Optional[float] = None
+        self.last_stats_time: Optional[float] = None
+
+        # Calculate stats interval: None = disabled, 0 = auto (min(60, sync_interval)), >0 = explicit
+        if config.stats_interval is None:
+            self.stats_interval: Optional[float] = None  # Disabled
+        elif config.stats_interval == 0:
+            self.stats_interval = min(60.0, self.config.sync_interval)  # Auto
+        else:
+            self.stats_interval = float(config.stats_interval)  # Explicit
+
+        # Rolling window statistics (prevents overflow for year-round operation)
+        # Keep last N cycles for accurate recent statistics
+        self.stats_window_size = 10000  # ~2.7 hours at 1s interval, ~3 days at 30s
+        self.recent_success: list[int] = []
+        self.recent_failed: list[int] = []
+        self.sync_times: list[float] = []  # Sync durations
+
+        # Lifetime counters (use for uptime display only, not averages)
+        self.total_success_count = 0
+        self.total_failed_count = 0
+
+        # Min/max tracking
+        self.min_sync_time: Optional[float] = None
+        self.max_sync_time: Optional[float] = None
+
+        # Per-camera statistics (also rolling window)
+        self.camera_stats: dict[str, dict[str, Any]] = {
+            camera.name: {
+                "recent_success": [],  # Rolling window
+                "recent_failed": [],   # Rolling window
+                "recent_times": [],    # Rolling window of sync times
+                "total_overlays": len(camera.overlays),
+                "lifetime_success": 0,  # For display only
+                "lifetime_failed": 0,   # For display only
+            }
+            for camera in config.cameras
+        }
 
     def _create_camera_clients(self) -> dict[str, HikvisionOverlay]:
         """
@@ -1141,6 +1242,196 @@ class SyncManager:
             clients[camera.name] = client
 
         return clients
+
+    async def _create_async_clients(self) -> dict[str, HikvisionOverlayAsync]:
+        """
+        Create persistent async clients for each camera.
+        These clients persist across sync cycles for maximum performance.
+
+        Returns:
+            Dictionary mapping camera name to HikvisionOverlayAsync client
+        """
+        clients = {}
+        for camera in self.config.cameras:
+            client = HikvisionOverlayAsync(
+                ip=camera.ip if ":" not in camera.ip else camera.ip.split(":")[0],
+                username=camera.username,
+                password=camera.password,
+                channel=camera.channel,
+            )
+
+            # Handle port if specified separately
+            if camera.port != 80:
+                client.ip = f"{camera.ip}:{camera.port}"
+            elif ":" not in camera.ip:
+                client.ip = f"{camera.ip}:80"
+
+            # Initialize the client
+            await client.initialize()
+            clients[camera.name] = client
+
+        return clients
+
+    async def _close_async_clients(self):
+        """Close all persistent async clients."""
+        if self.async_clients:
+            for client in self.async_clients.values():
+                await client.close()
+            self.async_clients = None
+
+    def _update_statistics(
+        self,
+        duration: float,
+        success_count: int,
+        failed_count: int,
+        camera_results: dict[str, dict[str, int]],
+    ):
+        """
+        Update runtime statistics with sync cycle results.
+        Uses rolling windows to prevent overflow during year-round operation.
+
+        Args:
+            duration: Sync cycle duration in seconds
+            success_count: Number of successful overlay updates
+            failed_count: Number of failed overlay updates
+            camera_results: Per-camera results dict with success/failed counts
+        """
+        # Update lifetime counters (for display only)
+        self.total_success_count += success_count
+        self.total_failed_count += failed_count
+
+        # Track min/max sync times
+        if self.min_sync_time is None or duration < self.min_sync_time:
+            self.min_sync_time = duration
+        if self.max_sync_time is None or duration > self.max_sync_time:
+            self.max_sync_time = duration
+
+        # Rolling window for recent statistics
+        self.recent_success.append(success_count)
+        self.recent_failed.append(failed_count)
+        self.sync_times.append(duration)
+
+        # Maintain window size
+        if len(self.recent_success) > self.stats_window_size:
+            self.recent_success.pop(0)
+        if len(self.recent_failed) > self.stats_window_size:
+            self.recent_failed.pop(0)
+        if len(self.sync_times) > self.stats_window_size:
+            self.sync_times.pop(0)
+
+        # Update per-camera statistics (rolling windows)
+        for camera_name, results in camera_results.items():
+            if camera_name in self.camera_stats:
+                stats = self.camera_stats[camera_name]
+
+                # Lifetime counters
+                stats["lifetime_success"] += results.get("success", 0)
+                stats["lifetime_failed"] += results.get("failed", 0)
+
+                # Rolling windows
+                stats["recent_success"].append(results.get("success", 0))
+                stats["recent_failed"].append(results.get("failed", 0))
+                stats["recent_times"].append(results.get("duration", 0.0))
+
+                # Maintain window size
+                if len(stats["recent_success"]) > self.stats_window_size:
+                    stats["recent_success"].pop(0)
+                if len(stats["recent_failed"]) > self.stats_window_size:
+                    stats["recent_failed"].pop(0)
+                if len(stats["recent_times"]) > self.stats_window_size:
+                    stats["recent_times"].pop(0)
+
+    def _format_uptime(self, seconds: float) -> str:
+        """
+        Format uptime in human-readable format.
+
+        Args:
+            seconds: Uptime in seconds
+
+        Returns:
+            Formatted string (e.g., "2h 15m 30s" or "45m 12s" or "23s")
+        """
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+
+        if hours > 0:
+            return f"{hours}h {minutes}m {secs}s"
+        elif minutes > 0:
+            return f"{minutes}m {secs}s"
+        else:
+            return f"{secs}s"
+
+    def _print_statistics(self):
+        """Print runtime statistics summary."""
+        if self.start_time is None:
+            return
+
+        current_time = time.time()
+        uptime = current_time - self.start_time
+
+        # Use rolling window for recent statistics
+        window_success = sum(self.recent_success) if self.recent_success else 0
+        window_failed = sum(self.recent_failed) if self.recent_failed else 0
+        window_total = window_success + window_failed
+
+        # Calculate success rate from rolling window
+        success_rate = (
+            (window_success / window_total * 100) if window_total > 0 else 0.0
+        )
+
+        # Calculate average sync time from rolling window
+        avg_sync_time = (
+            sum(self.sync_times) / len(self.sync_times) if self.sync_times else 0.0
+        )
+
+        # Log statistics
+        logging.info("=" * 70)
+        logging.info("RUNTIME STATISTICS")
+        logging.info("=" * 70)
+        logging.info(f"Uptime:           {self._format_uptime(uptime)}")
+        logging.info(f"Sync cycles:      {self.cycle_count}")
+        logging.info(
+            f"Window updates:   {window_total} ({window_success} success, {window_failed} failed)"
+        )
+        logging.info(
+            f"Lifetime updates: {self.total_success_count + self.total_failed_count} "
+            f"({self.total_success_count} success, {self.total_failed_count} failed)"
+        )
+        logging.info(f"Success rate:     {success_rate:.1f}% (window)")
+        logging.info(f"Avg sync time:    {avg_sync_time * 1000:.0f}ms (window)")
+        if self.min_sync_time is not None and self.max_sync_time is not None:
+            logging.info(
+                f"Min/Max sync:     {self.min_sync_time * 1000:.0f}ms / {self.max_sync_time * 1000:.0f}ms"
+            )
+        logging.info(
+            f"Window size:      {len(self.sync_times)} cycles"
+        )
+
+        # Per-camera statistics
+        logging.info("-" * 70)
+        logging.info("PER-CAMERA STATISTICS")
+        logging.info("-" * 70)
+        for camera_name, stats in sorted(self.camera_stats.items()):
+            # Use rolling window for calculations
+            window_cam_success = sum(stats["recent_success"]) if stats["recent_success"] else 0
+            window_cam_failed = sum(stats["recent_failed"]) if stats["recent_failed"] else 0
+            window_cam_total = window_cam_success + window_cam_failed
+
+            camera_success_rate = (
+                (window_cam_success / window_cam_total * 100) if window_cam_total > 0 else 0.0
+            )
+            avg_camera_time = (
+                sum(stats["recent_times"]) / len(stats["recent_times"])
+                if stats["recent_times"] else 0.0
+            )
+            overlays_str = f"{stats['total_overlays']} overlay{'s' if stats['total_overlays'] != 1 else ''}"
+
+            logging.info(
+                f"  {camera_name:20s} {window_cam_success:6d} success, {window_cam_failed:6d} failed  "
+                f"({camera_success_rate:5.1f}%)  avg: {avg_camera_time * 1000:4.0f}ms  [{overlays_str}]"
+            )
+        logging.info("=" * 70)
 
     def _sync_all_cameras_optimized(self) -> dict[str, Any]:
         """
@@ -1215,16 +1506,24 @@ class SyncManager:
         logging.info("Shutting down gracefully...")
         self.running = False
 
-    def run(self):
+    async def _run_async(self):
         """
-        Main sync loop - runs continuously until interrupted.
+        Async main loop - runs continuously with persistent event loop.
+        This avoids asyncio.run() overhead on every cycle.
         """
-        # T023: Setup signal handlers
-        signal.signal(signal.SIGINT, self._shutdown)
-        signal.signal(signal.SIGTERM, self._shutdown)
+        # Initialize runtime tracking
+        self.start_time = time.time()
+        self.last_stats_time = self.start_time
 
-        self.running = True
-        logging.info(f"Starting sync loop (interval: {self.config.sync_interval}s)")
+        # Create persistent async clients
+        self.async_clients = await self._create_async_clients()
+        logging.info(f"Initialized {len(self.async_clients)} persistent async clients")
+
+        # Log statistics configuration
+        if self.stats_interval is None:
+            logging.info("Statistics reporting: disabled")
+        else:
+            logging.info(f"Statistics will be reported every {self.stats_interval:.0f}s")
 
         # T022: Main sync loop with precise timing
         # Align to exact second boundaries for zero drift
@@ -1246,76 +1545,123 @@ class SyncManager:
             f"Aligning to next boundary: {next_sync_time - current:.3f}s from now"
         )
 
-        while self.running:
-            # Wait until next scheduled sync time
-            current_time = time.time()
-            if current_time < next_sync_time:
-                sleep_time = next_sync_time - current_time
-                # Use smaller sleep chunks for better responsiveness to shutdown
-                time.sleep(min(sleep_time, 0.05))
-                continue
+        try:
+            while self.running:
+                # Wait until next scheduled sync time
+                current_time = time.time()
+                if current_time < next_sync_time:
+                    sleep_time = next_sync_time - current_time
+                    # Use async sleep for better performance
+                    await asyncio.sleep(min(sleep_time, 0.05))
+                    continue
 
-            # We're at the exact boundary - start sync
-            self.cycle_count += 1
-            scheduled_time = next_sync_time  # Scheduled boundary time
+                # We're at the exact boundary - start sync
+                self.cycle_count += 1
+                scheduled_time = next_sync_time  # Scheduled boundary time
 
-            # Schedule next sync at exact boundary
-            next_sync_time = next_sync_time + self.config.sync_interval
+                # Schedule next sync at exact boundary
+                next_sync_time = next_sync_time + self.config.sync_interval
 
-            # T026: Check if previous sync still running (but don't block)
-            if self.syncing:
-                logging.warning(
-                    f"Sync cycle {self.cycle_count}: Previous sync still in progress (running in background). "
-                    f"Consider increasing sync_interval or timeout."
-                )
-                # Continue anyway - next cycle will start on schedule
-                continue
-
-            # Mark sync as in progress
-            self.syncing = True
-
-            # Launch sync in background (don't wait for completion)
-            try:
-                # T024: Sync cycle logging with drift measurement
-                actual_start = time.time()
-                drift = (actual_start - scheduled_time) * 1000  # ms
-                if abs(drift) > 10:  # Log if drift > 10ms
-                    logging.info(
-                        f"Starting sync cycle {self.cycle_count} (drift: {drift:+.1f}ms)"
-                    )
-                else:
-                    logging.info(f"Starting sync cycle {self.cycle_count}")
-                start_time = actual_start
-
-                # Perform sync using async (concurrent for multiple cameras)
-                results = asyncio.run(sync_all_cameras_async(self.config))
-
-                # Calculate duration
-                duration = time.time() - start_time
-
-                # T024: Completion logging
-                time_to_next = next_sync_time - time.time()
-
-                if duration > self.config.sync_interval:
+                # T026: Check if previous sync still running (but don't block)
+                if self.syncing:
                     logging.warning(
-                        f"Sync cycle {self.cycle_count} completed in {duration:.3f}s "
-                        f"(exceeded interval of {self.config.sync_interval}s by {duration - self.config.sync_interval:.3f}s). "
-                        f"Success: {results['total_success']}, Failed: {results['total_failed']}."
+                        f"Sync cycle {self.cycle_count}: Previous sync still in progress (running in background). "
+                        f"Consider increasing sync_interval or timeout."
                     )
-                else:
-                    logging.info(
-                        f"Sync cycle {self.cycle_count} completed in {duration:.3f}s. "
-                        f"Success: {results['total_success']}, Failed: {results['total_failed']}. "
-                        f"Next cycle in {time_to_next:.3f}s."
+                    # Continue anyway - next cycle will start on schedule
+                    continue
+
+                # Mark sync as in progress
+                self.syncing = True
+
+                # Launch sync
+                try:
+                    # T024: Sync cycle logging with drift measurement
+                    actual_start = time.time()
+                    drift = (actual_start - scheduled_time) * 1000  # ms
+                    if abs(drift) > 10:  # Log if drift > 10ms
+                        logging.info(
+                            f"Starting sync cycle {self.cycle_count} (drift: {drift:+.1f}ms)"
+                        )
+                    else:
+                        logging.info(f"Starting sync cycle {self.cycle_count}")
+                    start_time = actual_start
+
+                    # Perform sync using persistent clients (NO asyncio.run() overhead!)
+                    results = await sync_all_cameras_async(
+                        self.config, self.async_clients
                     )
 
-            except Exception as e:
-                logging.error(f"Error during sync cycle {self.cycle_count}: {e}")
+                    # Calculate duration
+                    duration = time.time() - start_time
 
-            finally:
-                self.syncing = False
+                    # Update statistics (always track, even if reporting is disabled)
+                    self._update_statistics(
+                        duration,
+                        results["total_success"],
+                        results["total_failed"],
+                        results["cameras"],
+                    )
 
-        logging.info("Sync loop stopped. Goodbye!")
+                    # T024: Completion logging
+                    time_to_next = next_sync_time - time.time()
+
+                    if duration > self.config.sync_interval:
+                        logging.warning(
+                            f"Sync cycle {self.cycle_count} completed in {duration:.3f}s "
+                            f"(exceeded interval of {self.config.sync_interval}s by {duration - self.config.sync_interval:.3f}s). "
+                            f"Success: {results['total_success']}, Failed: {results['total_failed']}."
+                        )
+                    else:
+                        logging.info(
+                            f"Sync cycle {self.cycle_count} completed in {duration:.3f}s. "
+                            f"Success: {results['total_success']}, Failed: {results['total_failed']}. "
+                            f"Next cycle in {time_to_next:.3f}s."
+                        )
+
+                    # Check if it's time to print statistics (only if enabled)
+                    if (
+                        self.stats_interval is not None
+                        and time.time() - self.last_stats_time >= self.stats_interval
+                    ):
+                        self._print_statistics()
+                        self.last_stats_time = time.time()
+
+                except Exception as e:
+                    logging.error(f"Error during sync cycle {self.cycle_count}: {e}")
+
+                finally:
+                    self.syncing = False
+
+        finally:
+            # Cleanup: close all async clients
+            logging.info("Closing async clients...")
+            await self._close_async_clients()
+
+            # Print final statistics summary (only if enabled)
+            if self.stats_interval is not None and self.cycle_count > 0:
+                logging.info("")
+                logging.info("FINAL STATISTICS SUMMARY")
+                self._print_statistics()
+
+    def run(self):
+        """
+        Main sync loop - runs continuously until interrupted.
+        """
+        # T023: Setup signal handlers
+        signal.signal(signal.SIGINT, self._shutdown)
+        signal.signal(signal.SIGTERM, self._shutdown)
+
+        self.running = True
+        logging.info(f"Starting sync loop (interval: {self.config.sync_interval}s)")
+
+        # Create and run persistent event loop (avoids asyncio.run() overhead)
+        try:
+            asyncio.run(self._run_async())
+        except KeyboardInterrupt:
+            logging.info("Received interrupt during async loop")
+        finally:
+            logging.info("Sync loop stopped. Goodbye!")
 
 
 # ============================================================================
